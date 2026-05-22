@@ -2,7 +2,7 @@
 
 Projekt z przedmiotu RBD (Rozproszone Bazy Danych) realizujący system zarządzania ligą piłkarską. 
 
-**Autorzy:** Szymon Muszyński (245883), Anton Pryhkodzka (284662).
+**Autorzy:** Szymon Muszyński, Anton Pryhkodzka.
 
 ## Architektura Systemu
 
