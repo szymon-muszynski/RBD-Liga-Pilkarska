@@ -5,6 +5,9 @@ Projekt z przedmiotu RBD (Rozproszone Bazy Danych) realizujący system zarządza
 **Autorzy:** Szymon Muszyński, Anton Pryhkodzka.
 
 ## Architektura Systemu
+<p align="center">
+  <img width="650" height="650" alt="image" src="https://github.com/user-attachments/assets/58bb52f4-642b-428c-800f-04d2e1408782" />
+</p>
 
 System oparto na mechanizmach Linked Server w środowisku SQL Server. Umożliwia to wykonywanie zapytań i procedur na połączonych, zdalnych instancjach bazodanowych. Wymiana danych realizowana jest poprzez zapytania `OPENQUERY`, wywołania funkcji w środowisku docelowym oraz wyzwalacze (triggery).
 
