@@ -1,0 +1,49 @@
+CREATE TABLE Sedziowie (
+    id_sedziego INT IDENTITY(1,1) PRIMARY KEY,
+    imie NVARCHAR(50) NOT NULL,
+    nazwisko NVARCHAR(50) NOT NULL,
+    data_urodzenia DATE NOT NULL
+);
+
+CREATE TABLE MeczeSedziowie (
+    id INT IDENTITY(1,1) PRIMARY KEY,
+    id_meczu INT NOT NULL,
+    id_sedziego INT NOT NULL, 
+    rola NVARCHAR(50) NOT NULL,
+    FOREIGN KEY (id_sedziego) REFERENCES Sedziowie(id_sedziego)
+);
+
+CREATE PROCEDURE DodajSedziego
+    @imie NVARCHAR(50),
+    @nazwisko NVARCHAR(50),
+    @data_urodzenia DATE
+AS
+BEGIN
+    INSERT INTO Sedziowie (imie, nazwisko, data_urodzenia)
+    VALUES (@imie, @nazwisko, @data_urodzenia);
+END;
+
+SELECT * FROM Sedziowie;
+
+CREATE OR ALTER TRIGGER ZapobiezDuplikatowiSedziego
+ON Sedziowie
+INSTEAD OF INSERT
+AS
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM Sedziowie s
+        JOIN inserted i
+        ON s.imie = i.imie
+           AND s.nazwisko = i.nazwisko
+           AND s.data_urodzenia = i.data_urodzenia
+    )
+    BEGIN
+        RAISERROR('Sędzia o tym samym imieniu, nazwisku i dacie urodzenia już istnieje.', 16, 1);
+        RETURN;
+    END
+
+    INSERT INTO Sedziowie (imie, nazwisko, data_urodzenia)
+    SELECT imie, nazwisko, data_urodzenia
+    FROM inserted;
+END;

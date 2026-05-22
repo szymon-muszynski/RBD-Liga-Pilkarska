@@ -1,0 +1,938 @@
+CREATE TABLE Stadiony (
+    id_stadionu INT IDENTITY(1,1) PRIMARY KEY,
+    nazwa NVARCHAR(100) NOT NULL,
+    miasto NVARCHAR(100) NOT NULL,
+    pojemnosc INT,
+    status BIT NOT NULL DEFAULT 1
+);
+
+CREATE TABLE Mecze (
+    id_meczu INT IDENTITY(1,1) PRIMARY KEY,
+    data_meczu DATE NOT NULL,
+    godzina TIME NOT NULL,
+    id_gospodarza INT NOT NULL,
+    id_goscia INT NOT NULL,
+    id_stadionu INT NULL,
+    wynik NVARCHAR(20) NULL,
+    CONSTRAINT fk_mecze_stadiony FOREIGN KEY (id_stadionu) REFERENCES Stadiony(id_stadionu)
+);
+
+CREATE TABLE WydarzeniaMeczowe (
+    id_wydarzenia INT IDENTITY(1,1) PRIMARY KEY,
+    id_meczu INT NOT NULL,
+    minuta INT NOT NULL,
+    typ_wydarzenia NVARCHAR(50) NOT NULL,
+    id_zawodnika INT NULL,
+    dodatkowe_info NVARCHAR(255) NULL,
+    FOREIGN KEY (id_meczu) REFERENCES Mecze(id_meczu)
+);
+
+CREATE UNIQUE INDEX UX_WydarzeniaMeczowe_Koniec
+ON WydarzeniaMeczowe(id_meczu)
+WHERE typ_wydarzenia = 'koniec';
+
+--triggery
+
+CREATE TRIGGER WalidacjaMeczu
+ON Mecze
+INSTEAD OF INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @id_gospodarza INT;
+    DECLARE @id_goscia INT;
+    DECLARE @wynik NVARCHAR(20);
+    DECLARE @data DATE;
+    DECLARE @godzina TIME;
+
+    SELECT 
+        @id_gospodarza = id_gospodarza,
+        @id_goscia = id_goscia,
+        @wynik = wynik,
+        @data = data_meczu,
+        @godzina = godzina
+    FROM inserted;
+
+    IF @id_gospodarza = @id_goscia
+    BEGIN
+        RAISERROR('Gospodarz i gość nie mogą być tym samym klubem.', 16, 1);
+        RETURN;
+    END
+
+    IF @wynik IS NOT NULL AND @wynik NOT LIKE '[0-9]%:[0-9]%'
+    BEGIN
+        RAISERROR('Niepoprawny format wyniku. Oczekiwany format: liczba:liczba, np. 2:1.', 16, 1);
+        RETURN;
+    END
+
+    IF @wynik IS NOT NULL
+    BEGIN
+        DECLARE @gole1 INT;
+        DECLARE @gole2 INT;
+
+        BEGIN TRY
+            SET @gole1 = CAST(LEFT(@wynik, CHARINDEX(':', @wynik) - 1) AS INT);
+            SET @gole2 = CAST(SUBSTRING(@wynik, CHARINDEX(':', @wynik) + 1, LEN(@wynik)) AS INT);
+
+            IF @gole1 < 0 OR @gole2 < 0
+            BEGIN
+                RAISERROR('Liczba goli nie może być ujemna.', 16, 1);
+                RETURN;
+            END
+        END TRY
+        BEGIN CATCH
+            RAISERROR('Niepoprawny format wyniku (nie udało się sparsować liczby).', 16, 1);
+            RETURN;
+        END CATCH
+    END
+
+    IF EXISTS (
+    SELECT 1
+    FROM Mecze
+    WHERE data_meczu = @data
+      AND (
+          id_gospodarza = @id_gospodarza OR
+          id_goscia = @id_gospodarza OR
+          id_gospodarza = @id_goscia OR
+          id_goscia = @id_goscia
+      )
+    )
+    BEGIN
+        RAISERROR('Jedna z drużyn ma już zaplanowany mecz tego dnia.', 16, 1);
+        RETURN;
+    END
+
+    INSERT INTO Mecze (data_meczu, godzina, id_gospodarza, id_goscia, id_stadionu, wynik)
+    SELECT data_meczu, godzina, id_gospodarza, id_goscia, id_stadionu, wynik
+    FROM inserted;
+END;
+
+CREATE OR ALTER TRIGGER trg_AktualizujMeczePoDodaniu
+ON Mecze
+AFTER INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @id_gospodarza INT, @id_goscia INT;
+
+    SELECT TOP 1
+        @id_gospodarza = id_gospodarza,
+        @id_goscia = id_goscia
+    FROM inserted;
+
+    DECLARE @Zawodnicy TABLE (id_zawodnika INT);
+
+    DECLARE @sql NVARCHAR(MAX);
+
+    SET @sql = '
+        SELECT id_zawodnika 
+        FROM OPENQUERY(ORACLE_LINK, 
+            ''SELECT id_zawodnika FROM SYSTEM.Zawodnicy WHERE id_klubu = ' + CAST(@id_gospodarza AS NVARCHAR) + ''')';
+
+    INSERT INTO @Zawodnicy (id_zawodnika)
+    EXEC(@sql);
+
+    SET @sql = '
+        SELECT id_zawodnika 
+        FROM OPENQUERY(ORACLE_LINK, 
+            ''SELECT id_zawodnika FROM SYSTEM.Zawodnicy WHERE id_klubu = ' + CAST(@id_goscia AS NVARCHAR) + ''')';
+
+    INSERT INTO @Zawodnicy (id_zawodnika)
+    EXEC(@sql);
+
+    DECLARE @id INT;
+    DECLARE @sql_call NVARCHAR(MAX);
+
+    DECLARE zawodnicy_cursor CURSOR FOR
+        SELECT id_zawodnika FROM @Zawodnicy;
+
+    OPEN zawodnicy_cursor;
+    FETCH NEXT FROM zawodnicy_cursor INTO @id;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @sql_call = '
+        BEGIN
+            SYSTEM.aktualizuj_statystyki(' + CAST(@id AS NVARCHAR) + ', 0, 0, 0, 0, 1);
+        END;';
+        EXEC (@sql_call) AT ORACLE_LINK;
+
+        FETCH NEXT FROM zawodnicy_cursor INTO @id;
+    END
+
+    CLOSE zawodnicy_cursor;
+    DEALLOCATE zawodnicy_cursor;
+END;
+
+CREATE OR ALTER TRIGGER trg_UpdateStats_AfterInsert
+ON WydarzeniaMeczowe
+AFTER INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @id_zawodnika INT,
+            @typ_wydarzenia NVARCHAR(50),
+            @gole INT = 0,
+            @asysty INT = 0,
+            @zolte INT = 0,
+            @czerwone INT = 0;
+
+    SELECT TOP 1
+        @id_zawodnika = id_zawodnika,
+        @typ_wydarzenia = typ_wydarzenia
+    FROM inserted;
+
+    IF @id_zawodnika IS NULL OR @typ_wydarzenia = 'koniec'
+        RETURN;
+
+    IF @typ_wydarzenia = 'gol' SET @gole = 1;
+    ELSE IF @typ_wydarzenia = 'asysta' SET @asysty = 1;
+    ELSE IF @typ_wydarzenia = 'zolta kartka' SET @zolte = 1;
+    ELSE IF @typ_wydarzenia = 'czerwona kartka' SET @czerwone = 1;
+
+    DECLARE @sql NVARCHAR(MAX);
+    SET @sql = '
+    BEGIN
+        SYSTEM.aktualizuj_statystyki(' 
+        + CAST(@id_zawodnika AS NVARCHAR) + ', ' 
+        + CAST(@gole AS NVARCHAR) + ', ' 
+        + CAST(@asysty AS NVARCHAR) + ', ' 
+        + CAST(@zolte AS NVARCHAR) + ', ' 
+        + CAST(@czerwone AS NVARCHAR) + ', 0);
+    END;';
+
+    EXEC (@sql) AT ORACLE_LINK;
+END;
+
+--procedury
+
+CREATE OR ALTER PROCEDURE dbo.DodajKlubOracle
+    @nazwa_klubu NVARCHAR(100)
+AS
+BEGIN
+    DECLARE @sql NVARCHAR(MAX);
+
+    SET @sql =
+        'BEGIN SYSTEM.dodaj_klub(''' + REPLACE(@nazwa_klubu, '''', '''''') + '''); END;';
+
+    EXEC (@sql) AT ORACLE_LINK;
+END;
+
+exec dbo.DodajKlubOracle @nazwa_klubu = N'Real Madrid';
+exec dbo.DodajKlubOracle @nazwa_klubu = N'Barcelona';
+exec dbo.DodajKlubOracle @nazwa_klubu = N'Bayern';
+exec dbo.DodajKlubOracle @nazwa_klubu = N'Arsenal';
+exec dbo.DodajKlubOracle @nazwa_klubu = N'Manchester City';
+exec dbo.DodajKlubOracle @nazwa_klubu = N'Inter Milan';
+
+CREATE PROCEDURE WyswietlKluby
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT *
+    FROM OPENQUERY(ORACLE_LINK, 'SELECT * FROM SYSTEM.Klub');
+END;
+
+exec WyswietlKluby;
+
+CREATE OR ALTER PROCEDURE dbo.DodajMenadzeraOracle
+    @imie NVARCHAR(50),
+    @nazwisko NVARCHAR(50),
+    @data_urodzenia DATE,
+    @klub NVARCHAR(100)
+AS
+BEGIN
+    DECLARE @sql NVARCHAR(MAX);
+    DECLARE @data_str VARCHAR(10) = CONVERT(VARCHAR(10), @data_urodzenia, 120);
+
+    SET @sql =
+        'BEGIN SYSTEM.dodaj_menadzera(''' + REPLACE(@imie, '''', '''''') + ''','''
+        + REPLACE(@nazwisko, '''', '''''') + ''',TO_DATE(''' + @data_str + ''',''YYYY-MM-DD''),''' + REPLACE(@klub, '''', '''''') + '''); END;';
+
+    EXEC (@sql) AT ORACLE_LINK;
+END;
+
+EXEC dbo.DodajMenadzeraOracle 'Carlo', 'Ancelotti', '1959-06-10', 'Real Madrid';
+EXEC dbo.DodajMenadzeraOracle 'Xavi', 'Hernandez', '1980-01-25', 'Barcelona';
+EXEC dbo.DodajMenadzeraOracle 'Thomas', 'Tuchel', '1973-08-29', 'Bayern';
+EXEC dbo.DodajMenadzeraOracle 'Mikel', 'Arteta', '1982-03-26', 'Arsenal';
+EXEC dbo.DodajMenadzeraOracle 'Pep', 'Guardiola', '1971-01-18', 'Manchester City';
+EXEC dbo.DodajMenadzeraOracle 'Simone', 'Inzaghi', '1976-04-05', 'Inter Milan';
+
+CREATE OR ALTER PROCEDURE dbo.DodajZawodnikaOracle
+    @imie NVARCHAR(50),
+    @nazwisko NVARCHAR(50),
+    @data_urodzenia DATE,
+    @klub NVARCHAR(100)
+AS
+BEGIN
+    DECLARE @sql NVARCHAR(MAX);
+    DECLARE @data_str VARCHAR(10) = CONVERT(VARCHAR(10), @data_urodzenia, 120);
+
+    SET @sql =
+        'BEGIN SYSTEM.dodaj_zawodnika(''' + REPLACE(@imie, '''', '''''') + ''','''
+        + REPLACE(@nazwisko, '''', '''''') + ''',TO_DATE(''' + @data_str + ''',''YYYY-MM-DD''),''' + REPLACE(@klub, '''', '''''') + '''); END;';
+
+    EXEC (@sql) AT ORACLE_LINK;
+END;
+
+EXEC dbo.DodajZawodnikaOracle 'Luka', 'Modric', '1985-09-09', 'Real Madrid';
+EXEC dbo.DodajZawodnikaOracle 'Toni', 'Kroos', '1990-01-04', 'Real Madrid';
+EXEC dbo.DodajZawodnikaOracle 'Vinicius', 'Junior', '2000-07-12', 'Real Madrid';
+EXEC dbo.DodajZawodnikaOracle 'Jude', 'Bellingham', '2003-06-29', 'Real Madrid';
+EXEC dbo.DodajZawodnikaOracle 'Antonio', 'Rudiger', '1993-03-03', 'Real Madrid';
+EXEC dbo.DodajZawodnikaOracle 'Thibaut', 'Courtois', '1992-05-11', 'Real Madrid';
+
+EXEC dbo.DodajZawodnikaOracle 'Robert', 'Lewandowski', '1988-08-21', 'Barcelona';
+EXEC dbo.DodajZawodnikaOracle 'Pedri', 'Gonzalez', '2002-11-25', 'Barcelona';
+EXEC dbo.DodajZawodnikaOracle 'Gavi', '', '2004-08-05', 'Barcelona';
+EXEC dbo.DodajZawodnikaOracle 'Marc-André', 'ter Stegen', '1992-04-30', 'Barcelona';
+EXEC dbo.DodajZawodnikaOracle 'Frenkie', 'de Jong', '1997-05-12', 'Barcelona';
+EXEC dbo.DodajZawodnikaOracle 'Jules', 'Kounde', '1998-11-12', 'Barcelona';
+
+EXEC dbo.DodajZawodnikaOracle 'Manuel', 'Neuer', '1986-03-27', 'Bayern';
+EXEC dbo.DodajZawodnikaOracle 'Joshua', 'Kimmich', '1995-02-08', 'Bayern';
+EXEC dbo.DodajZawodnikaOracle 'Jamal', 'Musiala', '2003-02-26', 'Bayern';
+EXEC dbo.DodajZawodnikaOracle 'Leroy', 'Sane', '1996-01-11', 'Bayern';
+EXEC dbo.DodajZawodnikaOracle 'Kingsley', 'Coman', '1996-06-13', 'Bayern';
+EXEC dbo.DodajZawodnikaOracle 'Dayot', 'Upamecano', '1998-10-27', 'Bayern';
+
+EXEC dbo.DodajZawodnikaOracle 'Bukayo', 'Saka', '2001-09-05', 'Arsenal';
+EXEC dbo.DodajZawodnikaOracle 'Martin', 'Odegaard', '1998-12-17', 'Arsenal';
+EXEC dbo.DodajZawodnikaOracle 'Aaron', 'Ramsdale', '1998-05-14', 'Arsenal';
+EXEC dbo.DodajZawodnikaOracle 'Gabriel', 'Martinelli', '2001-06-18', 'Arsenal';
+EXEC dbo.DodajZawodnikaOracle 'Declan', 'Rice', '1999-01-14', 'Arsenal';
+EXEC dbo.DodajZawodnikaOracle 'William', 'Saliba', '2001-03-24', 'Arsenal';
+
+EXEC dbo.DodajZawodnikaOracle 'Erling', 'Haaland', '2000-07-21', 'Manchester City';
+EXEC dbo.DodajZawodnikaOracle 'Kevin', 'De Bruyne', '1991-06-28', 'Manchester City';
+EXEC dbo.DodajZawodnikaOracle 'Phil', 'Foden', '2000-05-28', 'Manchester City';
+EXEC dbo.DodajZawodnikaOracle 'Ruben', 'Dias', '1997-05-14', 'Manchester City';
+EXEC dbo.DodajZawodnikaOracle 'Ederson', 'Moraes', '1993-08-17', 'Manchester City';
+EXEC dbo.DodajZawodnikaOracle 'Bernardo', 'Silva', '1994-08-10', 'Manchester City';
+
+EXEC dbo.DodajZawodnikaOracle 'Lautaro', 'Martinez', '1997-08-22', 'Inter Milan';
+EXEC dbo.DodajZawodnikaOracle 'Nicolo', 'Barella', '1997-02-07', 'Inter Milan';
+EXEC dbo.DodajZawodnikaOracle 'Hakan', 'Calhanoglu', '1994-02-08', 'Inter Milan';
+EXEC dbo.DodajZawodnikaOracle 'Federico', 'Dimarco', '1997-11-10', 'Inter Milan';
+EXEC dbo.DodajZawodnikaOracle 'Marcus', 'Thuram', '1997-08-06', 'Inter Milan';
+EXEC dbo.DodajZawodnikaOracle 'Yann', 'Sommer', '1988-12-17', 'Inter Milan';
+
+CREATE PROCEDURE WyswietlInfoOKlubie
+    @nazwa_klubu NVARCHAR(100)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @sql_menadzer NVARCHAR(MAX);
+    DECLARE @zapytanie_menadzer NVARCHAR(MAX);
+
+    SET @zapytanie_menadzer = '
+        SELECT k.nazwa AS nazwa_klubu, m.imie, m.nazwisko, m.data_urodzenia
+        FROM SYSTEM.MENADZER m
+        JOIN SYSTEM.KLUB k ON m.id_klubu = k.id_klubu
+        WHERE k.nazwa = ''' + REPLACE(@nazwa_klubu, '''', '''''') + '''';
+
+    SET @sql_menadzer = 'SELECT * FROM OPENQUERY(ORACLE_LINK, ''' + REPLACE(@zapytanie_menadzer, '''', '''''') + ''')';
+
+    PRINT '--- Menadżer klubu: ' + @nazwa_klubu;
+    EXEC (@sql_menadzer);
+
+    DECLARE @sql_zawodnicy NVARCHAR(MAX);
+    DECLARE @zapytanie_zawodnicy NVARCHAR(MAX);
+
+    SET @zapytanie_zawodnicy = '
+        SELECT z.imie, z.nazwisko, z.data_urodzenia
+        FROM SYSTEM.ZAWODNICY z
+        JOIN SYSTEM.KLUB k ON z.id_klubu = k.id_klubu
+        WHERE k.nazwa = ''' + REPLACE(@nazwa_klubu, '''', '''''') + '''';
+
+    SET @sql_zawodnicy = 'SELECT * FROM OPENQUERY(ORACLE_LINK, ''' + REPLACE(@zapytanie_zawodnicy, '''', '''''') + ''')';
+
+    PRINT '--- Zawodnicy klubu: ' + @nazwa_klubu;
+    EXEC (@sql_zawodnicy);
+END;
+
+exec WyswietlInfoOKlubie
+	@nazwa_klubu = 'Barcelona';
+
+CREATE PROCEDURE wywolaj_przeniesienie_zawodnika
+    @imie NVARCHAR(100),
+    @nazwisko NVARCHAR(100),
+    @data_urodzenia DATE,
+    @nazwa_klubu NVARCHAR(100)
+AS
+BEGIN
+    DECLARE @sql NVARCHAR(MAX)
+
+    SET @sql = '
+    BEGIN
+        SYSTEM.przenies_zawodnika(''' + @imie + ''', ''' + @nazwisko + ''', TO_DATE(''' + 
+        CONVERT(VARCHAR(10), @data_urodzenia, 120) + ''', ''YYYY-MM-DD''), ''' + 
+        @nazwa_klubu + ''');
+    END;'
+
+    EXECUTE (@sql) AT ORACLE_LINK
+END
+
+EXEC wywolaj_przeniesienie_zawodnika 
+    @imie = 'Luka',
+    @nazwisko = 'Modric',
+    @data_urodzenia = '1985-09-09',
+    @nazwa_klubu = 'Inter Milan';
+
+CREATE PROCEDURE wywolaj_zmiane_klubu_menadzera
+    @imie NVARCHAR(100),
+    @nazwisko NVARCHAR(100),
+    @data_urodzenia DATE,
+    @nazwa_klubu NVARCHAR(100)
+AS
+BEGIN
+    DECLARE @sql NVARCHAR(MAX)
+
+    SET @sql = '
+    BEGIN
+        SYSTEM.zmien_klub_menadzera(''' + @imie + ''', ''' + @nazwisko + ''', TO_DATE(''' + 
+        CONVERT(VARCHAR(10), @data_urodzenia, 120) + ''', ''YYYY-MM-DD''), ''' + 
+        @nazwa_klubu + ''');
+    END;'
+
+    EXECUTE (@sql) AT ORACLE_LINK
+END
+
+EXEC wywolaj_zmiane_klubu_menadzera
+    @imie = 'Carlo',
+    @nazwisko = 'Ancelotti',
+    @data_urodzenia = '1959-06-10',
+    @nazwa_klubu = 'Inter Milan';
+
+CREATE PROCEDURE DodajStadion
+    @nazwa NVARCHAR(100),
+    @miasto NVARCHAR(100),
+    @pojemnosc INT,
+    @status BIT = 1
+AS
+BEGIN
+    INSERT INTO Stadiony (nazwa, miasto, pojemnosc, status)
+    VALUES (@nazwa, @miasto, @pojemnosc, @status);
+END;
+
+EXEC DodajStadion 'Santiago Bernabéu', 'Madryt', 81044, 1;
+EXEC DodajStadion 'Camp Nou', 'Barcelona', 99354, 1;
+EXEC DodajStadion 'Allianz Arena', 'Monachium', 75000, 1;
+EXEC DodajStadion 'Emirates Stadium', 'Londyn', 60260, 1;
+EXEC DodajStadion 'Etihad Stadium', 'Manchester', 53400, 1;
+EXEC DodajStadion 'San Siro', 'Mediolan', 80018, 1;
+EXEC DodajStadion 'Old Trafford', 'Manchester', 74879, 1;
+
+CREATE PROCEDURE ZmienStatusStadionu
+    @nazwa NVARCHAR(100),
+    @nowy_status BIT
+AS
+BEGIN
+    UPDATE Stadiony
+    SET status = @nowy_status
+    WHERE nazwa = @nazwa;
+END;
+
+EXEC ZmienStatusStadionu @nazwa = 'Camp Nou', @nowy_status = 0;
+
+select * from Stadiony;
+
+CREATE OR ALTER PROCEDURE DodajMeczPoNazwach
+    @data_meczu DATE,
+    @godzina TIME,
+    @nazwa_gospodarza NVARCHAR(100),
+    @nazwa_goscia NVARCHAR(100),
+    @nazwa_stadionu     NVARCHAR(100) = NULL,
+    @wynik NVARCHAR(20) = NULL
+AS
+BEGIN
+    DECLARE @id_gospodarza INT;
+    DECLARE @id_goscia INT;
+	DECLARE @nowy_mecz_id INT;
+	DECLARE @id_stadionu INT;
+
+    SELECT @id_gospodarza = id_klubu
+    FROM OPENQUERY(ORACLE_LINK, 
+        'SELECT id_klubu, nazwa FROM SYSTEM.KLUB')
+    WHERE nazwa = @nazwa_gospodarza;
+
+    SELECT @id_goscia = id_klubu
+    FROM OPENQUERY(ORACLE_LINK, 
+        'SELECT id_klubu, nazwa FROM SYSTEM.KLUB')
+    WHERE nazwa = @nazwa_goscia;
+
+    IF @id_gospodarza IS NULL OR @id_goscia IS NULL
+    BEGIN
+        RAISERROR('Nie znaleziono jednego lub obu klubów w Oracle.', 16, 1);
+        RETURN;
+    END
+
+	IF @nazwa_stadionu IS NOT NULL
+    BEGIN
+        SELECT @id_stadionu = id_stadionu
+        FROM dbo.Stadiony
+        WHERE nazwa = @nazwa_stadionu;
+
+        IF @id_stadionu IS NULL
+        BEGIN
+            RAISERROR('Nie znaleziono stadionu o nazwie "%s".', 16, 1, @nazwa_stadionu);
+            RETURN;
+        END
+    END
+
+    INSERT INTO Mecze (data_meczu, godzina, id_gospodarza, id_goscia, id_stadionu, wynik)
+    VALUES (@data_meczu, @godzina, @id_gospodarza, @id_goscia, @id_stadionu, @wynik);
+
+    SET @nowy_mecz_id = SCOPE_IDENTITY();
+
+	BEGIN TRY
+        INSERT INTO OPENROWSET(
+            'Microsoft.ACE.OLEDB.12.0',
+            'Excel 12.0;HDR=YES;Database=C:\Northwind\mecze_liga_pilkarska.xlsx;',
+            'SELECT id_meczu, data_meczu, godzina, nazwa_gospodarza, nazwa_goscia, nazwa_stadionu, wynik FROM [Arkusz1$]'
+        )
+        SELECT
+            @nowy_mecz_id                     AS id_meczu,
+            @data_meczu                       AS data_meczu,
+            CONVERT(CHAR(8), @godzina, 108)   AS godzina,
+            @nazwa_gospodarza                 AS nazwa_gospodarza,
+            @nazwa_goscia                     AS nazwa_goscia,
+            @nazwa_stadionu					  AS nazwa_stadionu,
+            @wynik                            AS wynik;
+    END TRY
+    BEGIN CATCH
+        DECLARE @err NVARCHAR(4000) = ERROR_MESSAGE();
+        RAISERROR('Błąd eksportu do Excela: %s', 16, 1, @err);
+    END CATCH
+END;
+
+EXEC DodajMeczPoNazwach '2025-08-01', '18:00', 'Real Madrid', 'Barcelona', 'Santiago Bernabéu', '1:3';
+EXEC DodajMeczPoNazwach '2025-08-02', '20:00', 'Bayern', 'Arsenal', 'Allianz Arena', '2:1';
+EXEC DodajMeczPoNazwach '2025-08-03', '17:30', 'Manchester City', 'Inter Milan', 'Etihad Stadium', '2:2';
+EXEC DodajMeczPoNazwach '2025-08-04', '19:00', 'Arsenal', 'Real Madrid', 'Emirates Stadium', '1:1';
+EXEC DodajMeczPoNazwach '2025-08-05', '21:00', 'Barcelona', 'Manchester City', 'Old Trafford', '5:0';
+EXEC DodajMeczPoNazwach '2025-08-06', '18:30', 'Inter Milan', 'Bayern', 'San Siro', '0:0';
+EXEC DodajMeczPoNazwach '2025-08-07', '20:45', 'Real Madrid', 'Manchester City', 'Santiago Bernabéu', '4:4';
+
+select * from Mecze;
+
+CREATE OR ALTER FUNCTION dbo.detect_match_id
+(
+    @nazwa_gospodarza NVARCHAR(100),
+    @nazwa_goscia    NVARCHAR(100),
+    @data_meczu      DATE
+)
+RETURNS INT
+AS
+BEGIN
+    DECLARE @match_id INT;
+
+    SELECT 
+        @match_id = m.id_meczu
+    FROM dbo.Mecze AS m
+    INNER JOIN 
+        OPENQUERY(ORACLE_LINK,
+          'SELECT id_klubu, nazwa FROM SYSTEM.Klub' 
+        ) AS kg
+      ON m.id_gospodarza = kg.id_klubu
+      AND kg.nazwa = @nazwa_gospodarza
+    INNER JOIN 
+        OPENQUERY(ORACLE_LINK,
+          'SELECT id_klubu, nazwa FROM SYSTEM.Klub' 
+        ) AS kk 
+      ON m.id_goscia = kk.id_klubu
+      AND kk.nazwa = @nazwa_goscia
+    WHERE m.data_meczu = @data_meczu;
+
+    RETURN @match_id; 
+END;
+
+CREATE OR ALTER PROCEDURE DodajWydarzenieMeczowe
+    @nazwa_gospodarza NVARCHAR(100),
+    @nazwa_goscia NVARCHAR(100),
+    @data_meczu DATE,
+    @minuta INT,
+    @typ_wydarzenia NVARCHAR(50),
+    @imie NVARCHAR(50) = NULL,
+    @nazwisko NVARCHAR(50) = NULL,
+    @data_urodzenia DATE = NULL,
+    @dodatkowe_info NVARCHAR(255) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @id_meczu INT;
+    DECLARE @id_zawodnika INT = NULL;
+
+    SELECT @id_meczu = dbo.detect_match_id(@nazwa_gospodarza, @nazwa_goscia, @data_meczu);
+
+    IF @id_meczu IS NULL
+    BEGIN
+        RAISERROR('Nie znaleziono meczu o podanych danych.', 16, 1);
+        RETURN;
+    END
+
+    IF @minuta < 0 OR @minuta > 120
+    BEGIN
+        RAISERROR('Minuta musi być w zakresie 0–120.', 16, 1);
+        RETURN;
+    END
+
+    IF NOT EXISTS (
+        SELECT 1 FROM (VALUES ('gol'), ('asysta'), ('zolta kartka'), ('czerwona kartka'), ('koniec')) AS Typy(typ)
+        WHERE typ = @typ_wydarzenia
+    )
+    BEGIN
+        RAISERROR('Niepoprawny typ wydarzenia.', 16, 1);
+        RETURN;
+    END
+
+    IF @typ_wydarzenia <> 'koniec'
+    BEGIN
+        IF @imie IS NULL OR @nazwisko IS NULL OR @data_urodzenia IS NULL
+        BEGIN
+            RAISERROR('Brak danych zawodnika dla wybranego typu wydarzenia.', 16, 1);
+            RETURN;
+        END
+
+        BEGIN TRY
+            DECLARE @result TABLE (id_zawodnika INT);
+            DECLARE @data_str VARCHAR(10) = CONVERT(VARCHAR(10), @data_urodzenia, 120);
+
+            INSERT INTO @result (id_zawodnika)
+            EXEC (
+                'SELECT SYSTEM.detect_id(?, ?, TO_DATE(?, ''YYYY-MM-DD'')) AS id_zawodnika FROM DUAL',
+                @imie, @nazwisko, @data_str
+            ) AT ORACLE_LINK;
+
+            SELECT @id_zawodnika = id_zawodnika FROM @result;
+
+            IF @id_zawodnika IS NULL
+            BEGIN
+                RAISERROR('Nie znaleziono zawodnika w bazie Oracle.', 16, 1);
+                RETURN;
+            END
+        END TRY
+        BEGIN CATCH
+            RAISERROR('Nie udało się pobrać ID zawodnika z Oracle.', 16, 1);
+            RETURN;
+        END CATCH
+    END
+
+    INSERT INTO WydarzeniaMeczowe (id_meczu, minuta, typ_wydarzenia, id_zawodnika, dodatkowe_info)
+    VALUES (@id_meczu, @minuta, @typ_wydarzenia, @id_zawodnika, @dodatkowe_info);
+END;
+
+EXEC DodajWydarzenieMeczowe 'Real Madrid', 'Barcelona', '2025-08-01', 15, 'gol', 'Robert', 'Lewandowski', '1988-08-21', 'Prawa noga z pola karnego';
+EXEC DodajWydarzenieMeczowe 'Real Madrid', 'Barcelona', '2025-08-01', 22, 'gol', 'Vinicius', 'Junior', '2000-07-12', 'Kontra z lewej strony';
+EXEC DodajWydarzenieMeczowe 'Real Madrid', 'Barcelona', '2025-08-01', 15, 'asysta', 'Pedri', 'Gonzalez', '2002-11-25', NULL;
+EXEC DodajWydarzenieMeczowe 'Real Madrid', 'Barcelona', '2025-08-01', 22, 'asysta', 'Luka', 'Modric', '1985-09-09', NULL;
+EXEC DodajWydarzenieMeczowe 'Bayern', 'Arsenal', '2025-08-02', 38, 'zolta kartka', 'Dayot', 'Upamecano', '1998-10-27', 'Faul taktyczny';
+EXEC DodajWydarzenieMeczowe 'Bayern', 'Arsenal', '2025-08-02', 55, 'czerwona kartka', 'William', 'Saliba', '2001-03-24', 'Faul jako ostatni obrońca';
+EXEC DodajWydarzenieMeczowe 'Real Madrid', 'Barcelona', '2025-08-01', 90, 'koniec', NULL, NULL, NULL, 'Sędzia zakończył mecz';
+
+select * from WydarzeniaMeczowe
+
+ CREATE PROCEDURE PobierzZawodnikaZeStatystykami
+    @imie NVARCHAR(100),
+    @nazwisko NVARCHAR(100),
+    @data_urodzenia DATE
+AS
+BEGIN
+    DECLARE @sql NVARCHAR(MAX)
+    DECLARE @data_urodzenia_str NVARCHAR(20)
+
+    SET @data_urodzenia_str = CONVERT(NVARCHAR(10), @data_urodzenia, 120)
+
+    SET @sql = '
+    SELECT * FROM OPENQUERY(ORACLE_LINK, 
+        ''SELECT * FROM SYSTEM.vw_zawodnik_statystyki
+          WHERE imie = ''''' + @imie + ''''' 
+          AND nazwisko = ''''' + @nazwisko + '''''
+          AND data_urodzenia = TO_DATE(''''' + @data_urodzenia_str + ''''', ''''YYYY-MM-DD'''')'')'
+
+    EXEC sp_executesql @sql
+END
+
+EXEC PobierzZawodnikaZeStatystykami 'Dayot', 'Upamecano', '1998-10-27';
+EXEC PobierzZawodnikaZeStatystykami 'Robert', 'Lewandowski', '1988-08-21';
+EXEC PobierzZawodnikaZeStatystykami 'Pedri', 'Gonzalez', '2002-11-25';
+EXEC PobierzZawodnikaZeStatystykami 'William', 'Saliba', '2001-03-24';
+
+
+CREATE OR ALTER PROCEDURE dbo.DodajSedziegoZdalnie
+    @imie NVARCHAR(50),
+    @nazwisko NVARCHAR(50),
+    @data_urodzenia DATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @data_str VARCHAR(10) = CONVERT(VARCHAR(10), @data_urodzenia, 120);
+    DECLARE @sql NVARCHAR(MAX);
+
+    SET @sql = 'EXEC master.dbo.DodajSedziego ''' 
+             + REPLACE(@imie, '''', '''''') + ''', ''' 
+             + REPLACE(@nazwisko, '''', '''''') + ''', ''' 
+             + @data_str + '''';
+
+    EXEC (@sql) AT DOCKER_SQL;
+END;
+
+EXEC dbo.DodajSedziegoZdalnie 'Piotr', 'Nowak', '1980-05-14';
+EXEC dbo.DodajSedziegoZdalnie 'Marek', 'Kowalski', '1975-11-22';
+EXEC dbo.DodajSedziegoZdalnie 'Tomasz', 'Wiśniewski', '1988-03-30';
+EXEC dbo.DodajSedziegoZdalnie 'Andrzej', 'Lewandowski', '1982-07-08';
+EXEC dbo.DodajSedziegoZdalnie 'Krzysztof', 'Zieliński', '1979-01-19';
+EXEC dbo.DodajSedziegoZdalnie 'Marcin', 'Kamiński', '1990-12-05';
+
+CREATE OR ALTER PROCEDURE dbo.DodajSedziegoDoMeczuPoNazwach
+    @nazwa_gospodarza    NVARCHAR(100),
+    @nazwa_goscia        NVARCHAR(100),
+    @data_meczu          DATE,
+    @imie_sedziego       NVARCHAR(50),
+    @nazwisko_sedziego   NVARCHAR(50),
+    @data_ur_sedziego    DATE,
+    @rola                NVARCHAR(50)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @id_gosp INT, @id_gosc INT, @id_meczu INT, @id_sedziego INT;
+    DECLARE @data_ur_sedziego_str CHAR(10) = CONVERT(CHAR(10), @data_ur_sedziego, 120);
+    DECLARE @data_meczu_str CHAR(10) = CONVERT(CHAR(10), @data_meczu, 120);
+
+    SELECT @id_meczu = dbo.detect_match_id(@nazwa_gospodarza, @nazwa_goscia, @data_meczu);
+
+    IF @id_meczu IS NULL
+    BEGIN
+        RAISERROR('Nie znaleziono meczu o podanych parametrach.', 16, 1);
+        RETURN;
+    END
+
+    SELECT @id_sedziego = id_sedziego
+    FROM OPENQUERY(DOCKER_SQL,
+        'SELECT id_sedziego, imie, nazwisko, CONVERT(VARCHAR(10), data_urodzenia, 120) AS data_urodzenia_str FROM master.dbo.Sedziowie') AS remoteSedziowie
+    WHERE imie = @imie_sedziego
+      AND nazwisko = @nazwisko_sedziego
+      AND data_urodzenia_str = @data_ur_sedziego_str;
+
+    IF @id_sedziego IS NULL
+    BEGIN
+        DECLARE @sql_call_proc NVARCHAR(MAX) = 
+	'EXEC master.dbo.DodajSedziego ''' 
+	+ REPLACE(@imie_sedziego,'''','''''') + ''', ''' 
+	+ REPLACE(@nazwisko_sedziego,'''','''''') + ''', ''' 
+	+ @data_ur_sedziego_str + '''';
+
+	EXEC (@sql_call_proc) AT DOCKER_SQL;
+
+        SELECT @id_sedziego = id_sedziego
+        FROM OPENQUERY(DOCKER_SQL,
+            'SELECT id_sedziego, imie, nazwisko, CONVERT(VARCHAR(10), data_urodzenia, 120) AS data_urodzenia_str FROM master.dbo.Sedziowie') AS remoteSedziowie
+        WHERE imie = @imie_sedziego
+          AND nazwisko = @nazwisko_sedziego
+          AND data_urodzenia_str = @data_ur_sedziego_str;
+    END
+
+    DECLARE @sql_meczsedziowie NVARCHAR(MAX) = 
+        'INSERT INTO master.dbo.MeczeSedziowie (id_meczu, id_sedziego, rola) VALUES (' 
+        + CAST(@id_meczu AS NVARCHAR(10)) + ', ' 
+        + CAST(@id_sedziego AS NVARCHAR(10)) + ', ''' 
+        + REPLACE(@rola,'''','''''') + ''')';
+
+    EXEC (@sql_meczsedziowie) AT DOCKER_SQL;
+
+    PRINT 'Sędzia został przypisany do meczu.';
+END;
+
+EXEC DodajSedziegoDoMeczuPoNazwach 
+    'Real Madrid', 'Barcelona', '2025-08-01',
+    'Piotr', 'Nowak', '1980-05-14',
+    'sędzia główny';
+
+EXEC DodajSedziegoDoMeczuPoNazwach 
+    'Bayern', 'Arsenal', '2025-08-02',
+    'Marek', 'Kowalski', '1975-11-22',
+    'VAR';
+
+EXEC DodajSedziegoDoMeczuPoNazwach 
+    'Manchester City', 'Inter Milan', '2025-08-03',
+    'Tomasz', 'Wiśniewski', '1988-03-30',
+    'sędzia techniczny';
+
+EXEC DodajSedziegoDoMeczuPoNazwach 
+    'Arsenal', 'Real Madrid', '2025-08-04',
+    'Andrzej', 'Lewandowski', '1982-07-08',
+    'sędzia liniowy';
+
+EXEC DodajSedziegoDoMeczuPoNazwach 
+    'Barcelona', 'Manchester City', '2025-08-05',
+    'Krzysztof', 'Zieliński', '1979-01-19',
+    'asystent VAR';
+
+--nowy sedzia
+EXEC DodajSedziegoDoMeczuPoNazwach 
+    'Inter Milan', 'Bayern', '2025-08-06',
+    'Adam', 'Nowicki', '1983-04-25',
+    'sędzia główny';
+
+CREATE OR ALTER PROCEDURE dbo.PokazWszystkichSedziow
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    EXEC('
+        SELECT id_sedziego,
+               imie,
+               nazwisko,
+               CONVERT(VARCHAR(10), data_urodzenia, 120) AS data_urodzenia
+        FROM master.dbo.Sedziowie
+        ORDER BY nazwisko, imie;
+    ') AT DOCKER_SQL;
+END;
+GO
+
+exec PokazWszystkichSedziow
+
+go
+CREATE OR ALTER PROCEDURE dbo.PokazSzczegolyMeczuRozproszone
+    @nazwa_gospodarza  NVARCHAR(100),
+    @nazwa_goscia      NVARCHAR(100),
+    @data_meczu        DATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @id_gosp INT, @id_gosc INT, @id_meczu INT;
+
+    SELECT @id_gosp = id_klubu
+    FROM OPENQUERY(ORACLE_LINK,'SELECT id_klubu,nazwa FROM SYSTEM.KLUB')
+    WHERE nazwa = @nazwa_gospodarza;
+
+    SELECT @id_gosc = id_klubu
+    FROM OPENQUERY(ORACLE_LINK,'SELECT id_klubu,nazwa FROM SYSTEM.KLUB')
+    WHERE nazwa = @nazwa_goscia;
+
+    IF @id_gosp IS NULL OR @id_gosc IS NULL
+    BEGIN
+        RAISERROR('Drużyny nie znalezione w Oracle.',16,1); RETURN;
+    END
+
+    SELECT TOP 1 @id_meczu = id_meczu
+    FROM dbo.Mecze
+    WHERE id_gospodarza = @id_gosp
+      AND id_goscia     = @id_gosc
+      AND data_meczu    = @data_meczu;
+
+    IF @id_meczu IS NULL
+    BEGIN
+        RAISERROR('Mecz nie istnieje lokalnie.',16,1); RETURN;
+    END
+
+    DECLARE @stadion NVARCHAR(100);
+    SELECT @stadion = nazwa
+    FROM dbo.Stadiony
+    WHERE id_stadionu = (SELECT id_stadionu FROM dbo.Mecze WHERE id_meczu = @id_meczu);
+
+    PRINT '=== Szczegóły meczu ===';
+    PRINT 'Data: ' + CONVERT(VARCHAR(10), @data_meczu, 120)
+          + ' | Gospodarz: ' + @nazwa_gospodarza
+          + ' | Gość: ' + @nazwa_goscia
+          + ' | Stadion: ' + ISNULL(@stadion,'brak');
+    PRINT '-----------------------';
+
+    PRINT 'Wydarzenia:';
+    DECLARE ev_cursor CURSOR FOR
+        SELECT minuta, typ_wydarzenia, ISNULL(dodatkowe_info,'')
+        FROM dbo.WydarzeniaMeczowe
+        WHERE id_meczu = @id_meczu
+        ORDER BY minuta;
+    OPEN ev_cursor;
+    DECLARE @min INT, @typ NVARCHAR(50), @info NVARCHAR(255);
+    FETCH NEXT FROM ev_cursor INTO @min,@typ,@info;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        PRINT '  ['+RIGHT('00'+CAST(@min AS VARCHAR),2)+'] ' 
+              + @typ + CASE WHEN @info<>'' THEN ' ('+@info+')' ELSE '' END;
+        FETCH NEXT FROM ev_cursor INTO @min,@typ,@info;
+    END
+    CLOSE ev_cursor; DEALLOCATE ev_cursor;
+
+    PRINT '-----------------------';
+
+    PRINT 'Sędziowie:';
+
+	DECLARE @sql NVARCHAR(MAX) = '
+		SELECT s.imie + '' '' + s.nazwisko + '' ('' + CONVERT(VARCHAR(10), s.data_urodzenia, 120) + '')'' AS opis
+		FROM dbo.Sedziowie s
+		JOIN dbo.MeczeSedziowie ms ON s.id_sedziego = ms.id_sedziego
+		WHERE ms.id_meczu = ' + CAST(@id_meczu AS NVARCHAR(10)) + '
+		ORDER BY ms.id
+	';
+
+	CREATE TABLE #Sedziowie (opis NVARCHAR(200));
+
+	INSERT INTO #Sedziowie (opis)
+	EXEC (@sql) AT DOCKER_SQL;
+
+	DECLARE ref_cursor CURSOR FOR SELECT opis FROM #Sedziowie;
+
+	OPEN ref_cursor;
+
+	DECLARE @line NVARCHAR(200);
+
+	FETCH NEXT FROM ref_cursor INTO @line;
+
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		PRINT '  - ' + @line;
+		FETCH NEXT FROM ref_cursor INTO @line;
+	END
+
+	CLOSE ref_cursor;
+	DEALLOCATE ref_cursor;
+
+	DROP TABLE #Sedziowie;
+
+	PRINT '=======================';
+END;
+
+EXEC PokazSzczegolyMeczuRozproszone 'Real Madrid', 'Barcelona', '2025-08-01';
+
+go
+
+CREATE FUNCTION LiczbaMeczyNaStadionie(@id_stadionu INT)
+RETURNS INT
+AS
+BEGIN
+    DECLARE @liczba INT;
+    SELECT @liczba = COUNT(*) FROM Mecze WHERE id_stadionu = @id_stadionu;
+    RETURN @liczba;
+END;
+
+CREATE TRIGGER UnikalnaNazwaStadionu
+ON Stadiony
+INSTEAD OF INSERT
+AS
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM inserted i
+        JOIN Stadiony s ON s.nazwa = i.nazwa
+    )
+    BEGIN
+        RAISERROR('Stadion o tej nazwie już istnieje.', 16, 1);
+        RETURN;
+    END
+
+    INSERT INTO Stadiony (nazwa, miasto, pojemnosc, status)
+    SELECT nazwa, miasto, pojemnosc, status FROM inserted;
+END;
+
+SELECT dbo.LiczbaMeczyNaStadionie(1) AS LiczbaMeczy;
